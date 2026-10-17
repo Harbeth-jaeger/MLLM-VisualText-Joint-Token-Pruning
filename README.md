@@ -319,28 +319,35 @@ mllm_prune/
 ├── README.md                 # 项目入口与目录导航；新会话先读此文件
 ├── AGENTS.md                 # AI Agent 的长期协作、开发与实验规范
 ├── .env.example              # 机器路径配置模板；实际 .env 不提交
-├── requirements.txt         # 当前 Python 依赖
-├── configs/                  # 可版本化的实验配置（当前预留）
+├── pyproject.toml            # Python package 与测试配置
+├── requirements.txt         # 当前完整运行环境依赖
+├── configs/
+│   └── experiments/         # 各实验的可版本化超参数
 ├── data/
 │   └── interim/
 │       └── experiment_001/   # 实验 001 的可重建中间数据
 ├── docs/
+│   ├── algos/                # 算法设计与实现说明
 │   ├── feasibility_study.md  # 联合 token 剪枝的可行性调研
 │   └── experiments/
-│       └── 001_text_only_pruning.md  # text-only 剪枝实验说明
+│       ├── 001_text_only_pruning.md
+│       └── 002_chunk_based_joint_pruning.md
 ├── scripts/                  # 数据准备、实验运行和结果汇总入口
 │   ├── prepare_mmcoqa_subset.py
-│   ├── run_text_pruning.py
-│   └── summarize_text_pruning.py
+│   ├── run_joint_pruning.py
+│   └── summarize_joint_pruning.py
 ├── src/
 │   └── mllm_prune/
-│       └── text_pruning.py   # 可复用的文本 token/chunk 剪枝逻辑
-├── tests/                    # 数据准备与文本剪枝测试
+│       ├── algorithms/       # 模型无关的评分、预算与 token 选择
+│       ├── data/             # MMCoQA 读取、校验与 prompt 构造
+│       ├── evaluation/       # MMCoQA 指标
+│       ├── models/           # Qwen2.5-VL embedding、mRoPE 与解码适配
+│       └── config.py         # .env 路径与配置读取
+├── tests/                    # 纯算法、数据布局和已有流程测试
 ├── outputs/
 │   └── experiment_001/       # 实验 001 的预测、汇总与 smoke 结果
-├── notebooks/                # 探索性分析（当前预留）
-├── reports/                  # 正式实验结论、图表或论文材料（当前预留）
-└── requirements/             # 分场景依赖文件（当前预留）
+├── notebooks/                # 探索性分析（按需创建）
+└── reports/                  # 正式实验结论、图表或论文材料（按需创建）
 ```
 
 机器相关的数据、模型、环境和输出路径统一放在项目根目录 `.env`

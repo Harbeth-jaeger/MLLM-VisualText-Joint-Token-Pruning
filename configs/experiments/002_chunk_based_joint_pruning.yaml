@@ -1,0 +1,22 @@
+experiment: "002_chunk_based_joint_pruning"
+retentions: [0.75, 0.50, 0.25]
+methods:
+  - visual_only
+  - fixed_joint
+  - random_joint
+  - proposed_joint
+random_seeds: [0, 1, 2]
+max_new_tokens: 32
+max_pixels: 401408
+text_chunk:
+  min_tokens: 16
+  max_tokens: 64
+vision_window: 2
+token_top_fraction: 0.20
+chunk_top_fraction: 0.20
+modality_temperature: 0.10
+chunk_temperature: 0.10
+min_text_fraction: 0.05
+min_vision_fraction: 0.10
+fixed_text_fraction: 0.50
+

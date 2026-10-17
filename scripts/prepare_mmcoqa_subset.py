@@ -1,4 +1,4 @@
-"""Select the fixed 50-sample MMCoQA subset for experiment 001.
+"""Select the shared fixed MMCoQA subset used by project experiments.
 
 Input is the official ``MMCoQA.json`` annotation. Output is a compact JSON file
 that preserves the task instruction and full sample records for later inference.
@@ -19,7 +19,7 @@ def parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser()
     annotation = path_from_env("MMCOQA_ANNOTATION_PATH")
-    output = path_from_env("EXPERIMENT_001_SUBSET_PATH")
+    output = path_from_env("MMCOQA_SUBSET_PATH")
     parser.add_argument(
         "--annotation",
         type=Path,
@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=output,
         required=output is None,
-        help="Defaults to EXPERIMENT_001_SUBSET_PATH from .env.",
+        help="Defaults to MMCOQA_SUBSET_PATH from .env.",
     )
     parser.add_argument("--num-samples", type=int, default=50)
     parser.add_argument("--min-context-words", type=int, default=128)

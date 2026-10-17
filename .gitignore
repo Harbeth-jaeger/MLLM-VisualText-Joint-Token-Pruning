@@ -4,7 +4,7 @@
 __pycache__/
 .pytest_cache/
 *.py[cod]
-outputs/
+/outputs/
 
 # =========================
 # Python cache
@@ -38,11 +38,11 @@ env/
 # =========================
 # Large data / models / outputs
 # =========================
-data/
-models/
-outputs/
-runs/
-checkpoints/
+/data/
+/models/
+/outputs/
+/runs/
+/checkpoints/
 **/checkpoint-*/
 
 # =========================
