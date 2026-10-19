@@ -1,0 +1,31 @@
+experiment: "004_learned_utility_scorer"
+retentions: [0.75, 0.50, 0.25]
+max_new_tokens: 32
+max_pixels: 401408
+text_chunk:
+  min_tokens: 16
+  max_tokens: 64
+# Utility is learned per moderately sized region; token selection remains fine-grained.
+vision_window: 4
+token_top_fraction: 0.20
+chunk_top_fraction: 0.20
+label_generation:
+  variant_batch_size: 8
+teacher:
+  include_eos_in_label: false
+features:
+  projection_dim: 256
+  hidden_dim: 256
+  modality_dim: 16
+  dropout: 0.10
+training:
+  seeds: [0, 1, 2]
+  epochs: 100
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  huber_weight: 0.25
+  pair_gap_threshold: 0.001
+  max_pairs_per_type_per_sample: 256
+  patience: 12
+planning:
+  density_gamma: 1.0

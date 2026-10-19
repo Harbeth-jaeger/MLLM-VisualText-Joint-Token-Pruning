@@ -1,7 +1,7 @@
 # 003 · Joint Pruning with an External Aligned Encoder
 
-> 状态：待实现、待实验。
-> 本文预先记录实验目的、方法、评价口径与结果判定标准；不包含尚未运行的结果。
+> 状态：正式实验已完成。
+> 固定 50 样本、22 个条件的主实验于 2026-10-19 完成；本文同时保留预注册设计、完整性边界和正式结果。
 
 ## 1. Objective
 
@@ -220,11 +220,125 @@ token score
 | 相关性不等于回答效用 | 分数合理但 Accuracy 无提升 | 进入实验 004，直接学习 marginal utility |
 | 外部 encoder 开销过大 | 端到端无加速 | 特征缓存、batch、更小 encoder，或只在长序列上启用 |
 
+### 4.5 结果完整性与运行情况
+
+正式实验使用 GPU 6、7 做两路样本并行，于 2026-10-19 10:17:11 CST 启动，10:23:36 CST 完成，墙钟为 **6 分 25 秒**。两个 shard 各处理 25 个样本；Qwen 和外部 encoder 均为 BF16，Qwen 实际 attention backend 为 FlashAttention 2。
+
+| 检查项 | 预期 | 实际 | 状态 |
+| --- | ---: | ---: | --- |
+| Test 样本 | 50 | 50 | 完整 |
+| 条件数 | 22 | 22 | 完整 |
+| 逐样本记录 | $50\times22=1100$ | 1100 | 完整 |
+| 唯一 `(sample, method, retention, seed)` | 1100 | 1100 | 无重复 |
+| 严格预算偏差 | 全部为 0 | 全部为 0 | 通过 |
+| Attention backend | FlashAttention 2 | FlashAttention 2 | 通过 |
+| NaN / OOM / 静默失败 | 0 | 0 | 通过 |
+
+calibration artifact 来自 50 个无答案样本，记录了 15,144 个文本候选和 95,586 个视觉候选；与固定 50 test 的 sample ID 无交集。正式结果文件约 82.2 MB，summary 和两个 shard 均正常落盘。
+
+有一项预注册完整性门槛需要单独说明：smoke 中 100% retention 的候选集合、输入长度和首个生成位置 logits 与 Transformers 原生 `generate()` 完全一致，但 sample 110 在后续 BF16 greedy decode 中出现 token-level 分叉：自定义路径不输出答案引号，原生路径输出引号，两者均得到正确答案 `A Midsummer Night's Dream`。因此没有满足“所有样本逐 token 完全一致”的最强回归标准。正式实验的所有方法都使用同一个自定义 mRoPE decoder，方法间比较口径一致，但 No Pruning 不应表述为与当前 Transformers `generate()` 已证明逐位等价。
+
+### 4.6 分数空间与校准效果
+
+下表报告固定 test 上全部 token 的总体分布：
+
+| 分数 | Text mean ± std | Vision mean ± std | 观察 |
+| --- | ---: | ---: | --- |
+| Raw aligned cosine | 0.713 ± 0.087 | 0.231 ± 0.032 | 仍存在明显跨模态尺度差异 |
+| Calibrated percentile | 0.546 ± 0.277 | 0.510 ± 0.293 | 两种模态已进入近似可比的 $[0,1]$ 分位数尺度 |
+
+校准后的最大值饱和比例很低：text 为 0.32%，vision 为 0.009%；没有出现大面积压到 0 或 1 的退化。test text 均值略高于 0.5，说明存在轻微 calibration/test drift，但远小于 raw cosine 的模态差异。
+
+校准也明显改变了模态预算。平均保留 token 数如下：
+
+| Retention | Raw/Uncalibrated Text | Raw/Uncalibrated Vision | Calibrated Text | Calibrated Vision |
+| ---: | ---: | ---: | ---: | ---: |
+| 75% | 454 | 1,468 | 388 | 1,533 |
+| 50% | 434 | 847 | 336 | 945 |
+| 25% | 349 | 291 | 241 | 399 |
+
+因此，实验的第一个问题可以肯定回答：**外部 aligned space 本身仍有 text–vision raw-score 偏移，但 empirical CDF 成功消除了数量级不可比，并避免预算退化为优先保留几乎全部文本。**
+
+这里有一个实现口径需要澄清：`Random Joint` 只随机化模态内部的 token/chunk 分数，模态总预算仍使用当前传入的 aligned-calibrated modality score。因此它与 Aligned Calibrated 在每个样本上的 Text/Vision 总预算完全相同；二者比较隔离的是“同一模态预算下，aligned 排序是否优于随机排序”，不是一个连模态预算也完全随机的无信息基线。
+
+### 4.7 下游主结果
+
+固定 50 test 样本上的 Accuracy：
+
+| 方法 | 75% | 50% | 25% |
+| --- | ---: | ---: | ---: |
+| Fixed Joint | 60% | 50% | 48% |
+| Random Joint，3-seed mean ± std | 63.3% ± 2.5% | 53.3% ± 2.5% | 41.3% ± 0.9% |
+| Raw Qwen Joint | **68%** | **58%** | **54%** |
+| Aligned Uncalibrated | 60% | **58%** | 48% |
+| **Aligned Calibrated** | 62% | 48% | 46% |
+
+No Pruning Accuracy 为 70%。对应 Robust Accuracy：
+
+| 方法 | 75% | 50% | 25% |
+| --- | ---: | ---: | ---: |
+| Fixed Joint | 62% | 52% | 50% |
+| Random Joint，3-seed mean ± std | 64.7% ± 1.9% | 54.7% ± 3.4% | 42.7% ± 0.9% |
+| Raw Qwen Joint | **68%** | 58% | **54%** |
+| Aligned Uncalibrated | 62% | **60%** | 50% |
+| **Aligned Calibrated** | 64% | 50% | 48% |
+
+Aligned Calibrated 的 Accuracy 及 95% Wilson interval 分别为：
+
+| Retention | Accuracy | 95% CI |
+| ---: | ---: | ---: |
+| 75% | 62% | 48.2%–74.1% |
+| 50% | 48% | 34.8%–61.5% |
+| 25% | 46% | 33.0%–59.6% |
+
+配对结果进一步说明没有稳定收益：
+
+- 75% 下，Aligned Calibrated 相对 Raw Qwen 为 1 个由错变对、4 个由对变错、45 个不变，exact McNemar $p=0.375$；相对三个 Random seed 分别为 2/4、2/3、3/2，均不显著。
+- 50% 下，相对 Raw Qwen 为 2/7，$p=0.180$；相对 Aligned Uncalibrated 为 3/8，$p=0.227$。这是主预算上方向最明确的负信号。
+- 25% 下，相对 Raw Qwen 为 2/6，$p=0.289$；虽然高于 Random 的三 seed 均值 4.7 percentage points，但逐 seed 配对检验均不显著，而且仍低于 Fixed 和 Uncalibrated。
+
+所以，校准解决了“分数能否跨模态比较”，却没有解决“相似度是否代表回答效用”。Aligned Calibrated 没有在 75% 和 50% 两个预注册主预算上超过 Random mean，更没有超过 Raw Qwen；主假设不成立。
+
+### 4.8 速度、显存与离线成本
+
+外部 encoder 每个样本只计算一次，并在全部 retention 和条件间复用。平均额外成本为：
+
+| 阶段 | 平均耗时 |
+| --- | ---: |
+| External text encoding | 20.1 ms |
+| External vision encoding | 33.6 ms |
+| Grid mapping | 0.6 ms |
+| **External scorer 合计** | **54.3 ms/sample** |
+
+Aligned Calibrated 的部署侧 scorer + planner + prefill 为：
+
+| Retention | External + planner + prefill | No Pruning prefill | Prefill-only 降幅 | 峰值显存 |
+| ---: | ---: | ---: | ---: | ---: |
+| 75% | 269.7 ms | 262.6 ms | 24.7% | 16.48 GB |
+| 50% | 200.9 ms | 262.6 ms | 47.6% | 16.28 GB |
+| 25% | 139.2 ms | 262.6 ms | 71.0% | 16.08 GB |
+
+75% 的 prefill 节省约 64.8 ms，几乎被 54.3 ms external scoring 和 17.6 ms planning 抵消，部署侧反而比 No Pruning prefill 多约 7 ms。50% 和 25% 仍分别保留约 62 ms 和 123 ms 的 prefill-side 净节省，但 Accuracy 已明显下降。decode 均值约 431–503 ms，受生成内容和长度影响较大，不宜将变化直接归因于 pruning。
+
+完整两卡实验墙钟 6 分 25 秒，峰值显存不超过 16.68 GB。工程上 external encoder 成本可控，问题主要不在速度或显存，而在选择质量。
+
+### 4.9 结论
+
+实验 003 得到一个清晰的拆分结论：
+
+1. **跨模态标度问题被解决。** empirical CDF 将 text/vision 分数变为近似可比的分位数，并实质改变了模态预算。
+2. **下游 pruning 问题没有被解决。** Aligned Calibrated 在 75%/50%/25% 上分别为 62%/48%/46%，三个预算均低于 Raw Qwen 的 68%/58%/54%。
+3. **失败不主要来自 external encoder 太慢。** 54 ms/sample 的额外打分成本可接受，50% 和 25% 仍有 prefill-side 净节省；真正瓶颈是相关性排序与答案 utility 错位。
+4. **CDF 不是免费收益。** Uncalibrated 在 50% 和 25% 分别比 Calibrated 高 10 和 2 percentage points，说明强行修正模态尺度虽然让预算更平衡，却可能丢掉某些对当前数据有用的文本偏置。
+5. **当前 CLIP patch/text similarity 不适合作为独立主 selector。** 它可以作为局部辅助特征或边界 token 选择器，但证据不支持直接替换 Raw Qwen scorer。
+
+因此，本实验不支持继续扩大同一 Aligned Calibrated 方案。更准确的研究结论是：**“对齐空间 + 分模态校准”修复了可比性，却没有证明 semantic relevance 等价于 deletion utility。**
+
 ## 5. Next
 
-1. 先用 3–5 个非 test 样本验证 patch feature 的投影、grid 映射和显著区域可视化；
-2. 固化 external encoder checkpoint 与 calibration split，再实现缓存和多卡样本并行；
-3. 先运行 5 样本的 100% 回归与严格预算 smoke test；
-4. 通过后运行固定 50 样本，保留 raw score，使任何校准结果均可重算；
-5. 若 aligned score 稳定优于 random，再扩大数据和 benchmark；若仅改善分布却不改善答案，直接转入实验 004。
+1. 不扩大当前 CLIP + CDF 主 selector；优先对 Aligned Calibrated 相对 Raw Qwen 的 50% 预算 2/7 paired case 做区域和 chunk 可视化，确认失败来自 dense patch alignment、文本窗口还是 relevance/utility 错位。
+2. 后续若继续使用 external encoder，将其定位为辅助组件：提供 scorer similarity 特征，或只负责边界 chunk 内 token 选择，而不是独立决定所有 chunk 的去留。
+3. 若要重新挑战独立 aligned selector，应换用明确支持 dense retrieval/grounding 的 checkpoint，并先在独立 validation 上验证局部区域召回，再进入 50 test。
+4. 下一次随机对照需区分两种口径：`random within calibrated modality budget` 与 `fully random joint budget + selection`，避免把模态预算信息混入“无信息”基线。
+5. 在后续正式实验前处理 100% retention 与当前 Transformers 原生 `generate()` 的 token-level decode 差异，或把基线定义明确固定为项目自定义 decoder，并冻结软件版本。
 

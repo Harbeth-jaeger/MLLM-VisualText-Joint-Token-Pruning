@@ -47,8 +47,6 @@ def _text_windows(
             char_start = encoded.text_candidate_char_spans[local[0]][0]
             char_end = encoded.text_candidate_char_spans[local[-1]][1]
             text = encoded.expanded_prompt[char_start:char_end].strip()
-            if not text:
-                raise ValueError("text scoring window became empty after alignment")
             texts.append(text)
             covered.append(local)
     counts = [0] * encoded.layout.num_text_tokens
@@ -58,6 +56,23 @@ def _text_windows(
     if any(count == 0 for count in counts):
         raise ValueError("text scoring windows do not cover every candidate token")
     return texts, covered
+
+
+def _encode_text_window_scores(
+    encoder: CLIPAlignedEncoder, question: str, windows: Sequence[str]
+) -> tuple[torch.Tensor, torch.Tensor, float]:
+    """Score semantic windows and assign cosine lower-bound to blank windows."""
+
+    nonblank = [index for index, text in enumerate(windows) if text]
+    started = time.perf_counter()
+    text_features = encoder.encode_text([question, *(windows[index] for index in nonblank)])
+    text_encode_ms = (time.perf_counter() - started) * 1000
+    query = text_features[0]
+    scores = torch.full((len(windows),), -1.0, dtype=torch.float32)
+    if nonblank:
+        semantic_scores = text_features[1:] @ query
+        scores[torch.tensor(nonblank, dtype=torch.long)] = semantic_scores.float().cpu()
+    return query, scores, text_encode_ms
 
 
 def _map_patch_scores(score_map: torch.Tensor, height: int, width: int) -> torch.Tensor:
@@ -81,11 +96,9 @@ def compute_aligned_raw_scores(
     """Compute aligned token scores without changing Qwen representations."""
 
     windows, coverage = _text_windows(encoded, window_tokens, stride_tokens)
-    started = time.perf_counter()
-    text_features = encoder.encode_text([question, *windows])
-    text_encode_ms = (time.perf_counter() - started) * 1000
-    query = text_features[0]
-    window_scores = text_features[1:] @ query
+    query, window_scores, text_encode_ms = _encode_text_window_scores(
+        encoder, question, windows
+    )
     text_sum = torch.zeros(encoded.layout.num_text_tokens, dtype=torch.float32)
     text_count = torch.zeros_like(text_sum)
     for score, indices in zip(window_scores, coverage, strict=True):

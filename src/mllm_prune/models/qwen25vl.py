@@ -49,6 +49,23 @@ class GenerationResult:
     compressed_input_tokens: int
 
 
+@dataclass(frozen=True)
+class AnswerNLL:
+    """Gold-answer teacher-forced loss with an explicit token count."""
+
+    mean_nll: float
+    sum_nll: float
+    num_answer_tokens: int
+
+
+@dataclass(frozen=True)
+class CandidateSelection:
+    """Candidate indices retained from the original text/vision layouts."""
+
+    text_indices: tuple[int, ...]
+    vision_indices: tuple[int, ...]
+
+
 def _find_in_order(text: str, values: list[str]) -> list[tuple[int, int]]:
     spans: list[tuple[int, int]] = []
     cursor = 0
@@ -267,6 +284,212 @@ def candidate_embeddings(encoded: EncodedSample) -> tuple[torch.Tensor, torch.Te
         hidden[encoded.vision_sequence_indices],
         hidden[encoded.query_sequence_indices],
     )
+
+
+def answer_token_ids(processor: Any, answer: str, *, device: torch.device) -> torch.Tensor:
+    """Tokenize answer content only; the prompt already contains the assistant prefix."""
+
+    ids = processor.tokenizer(
+        answer,
+        add_special_tokens=False,
+        return_attention_mask=False,
+    )["input_ids"]
+    if not ids:
+        raise ValueError("gold answer tokenization is empty")
+    return torch.tensor(ids, dtype=torch.long, device=device)
+
+
+def _variant_sequence_indices(
+    encoded: EncodedSample, deleted_chunk: tuple[str, Chunk] | None
+) -> torch.Tensor:
+    """Return prompt indices after deleting exactly one candidate chunk."""
+
+    length = encoded.input_embeddings.shape[1]
+    if deleted_chunk is None:
+        return torch.arange(length, device=encoded.input_embeddings.device)
+    modality, chunk = deleted_chunk
+    if modality == "text":
+        candidate_positions = encoded.text_sequence_indices
+    elif modality == "vision":
+        candidate_positions = encoded.vision_sequence_indices
+    else:
+        raise ValueError(f"unknown deletion modality: {modality}")
+    deleted = candidate_positions[list(chunk.token_indices)]
+    keep_mask = torch.ones(length, dtype=torch.bool, device=deleted.device)
+    keep_mask[deleted] = False
+    return torch.nonzero(keep_mask, as_tuple=False).flatten()
+
+
+def score_gold_answer_variants(
+    model: Any,
+    encoded: EncodedSample,
+    answer_ids: torch.Tensor,
+    deleted_chunks: list[tuple[str, Chunk] | None],
+    *,
+    variant_batch_size: int,
+) -> list[AnswerNLL]:
+    """Score full/deleted prompts, batching variants with equal sequence length.
+
+    Equal-length grouping avoids padding between prompt and answer and lets
+    ``logits_to_keep`` materialize only the answer boundary logits.
+    """
+
+    if variant_batch_size < 1:
+        raise ValueError("variant_batch_size must be positive")
+    if answer_ids.ndim != 1 or not len(answer_ids):
+        raise ValueError("answer_ids must be a non-empty rank-1 tensor")
+    device = encoded.input_embeddings.device
+    answer_ids = answer_ids.to(device)
+    answer_embeddings = model.get_input_embeddings()(answer_ids)
+    grouped: dict[int, list[tuple[int, torch.Tensor]]] = {}
+    for order, chunk in enumerate(deleted_chunks):
+        keep = _variant_sequence_indices(encoded, chunk)
+        grouped.setdefault(len(keep), []).append((order, keep))
+    results: list[AnswerNLL | None] = [None] * len(deleted_chunks)
+    answer_length = len(answer_ids)
+    loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
+    for prompt_length, variants in grouped.items():
+        for start in range(0, len(variants), variant_batch_size):
+            batch = variants[start : start + variant_batch_size]
+            embeddings = torch.stack(
+                [
+                    torch.cat((encoded.input_embeddings[0, keep], answer_embeddings), dim=0)
+                    for _, keep in batch
+                ]
+            )
+            prompt_positions = torch.stack(
+                [encoded.position_ids[:, 0, keep] for _, keep in batch], dim=1
+            )
+            next_position = int(encoded.position_ids.max().item()) + 1
+            answer_positions = torch.arange(
+                next_position,
+                next_position + answer_length,
+                dtype=prompt_positions.dtype,
+                device=device,
+            ).view(1, 1, -1).expand(3, len(batch), -1)
+            position_ids = torch.cat((prompt_positions, answer_positions), dim=2)
+            total_length = prompt_length + answer_length
+            outputs = model(
+                inputs_embeds=embeddings,
+                position_ids=position_ids,
+                attention_mask=torch.ones(
+                    (len(batch), total_length), dtype=torch.long, device=device
+                ),
+                use_cache=False,
+                logits_to_keep=answer_length + 1,
+                return_dict=True,
+            )
+            # Returned logits cover prompt[-1], answer[0], ..., answer[-1].
+            answer_logits = outputs.logits[:, :answer_length].float()
+            targets = answer_ids.unsqueeze(0).expand(len(batch), -1)
+            token_losses = loss_fn(
+                answer_logits.reshape(-1, answer_logits.shape[-1]), targets.reshape(-1)
+            ).reshape(len(batch), answer_length)
+            sums = token_losses.sum(dim=1)
+            for local, (order, _) in enumerate(batch):
+                results[order] = AnswerNLL(
+                    mean_nll=float((sums[local] / answer_length).item()),
+                    sum_nll=float(sums[local].item()),
+                    num_answer_tokens=answer_length,
+                )
+    if any(value is None for value in results):
+        raise RuntimeError("missing teacher-forced variant result")
+    return [value for value in results if value is not None]
+
+
+def _selection_sequence_indices(
+    encoded: EncodedSample, selection: CandidateSelection
+) -> torch.Tensor:
+    """Map a candidate selection back to ordered full-sequence positions."""
+
+    text = tuple(int(value) for value in selection.text_indices)
+    vision = tuple(int(value) for value in selection.vision_indices)
+    if len(set(text)) != len(text) or len(set(vision)) != len(vision):
+        raise ValueError("candidate selections cannot contain duplicate indices")
+    if any(value < 0 or value >= encoded.layout.num_text_tokens for value in text):
+        raise ValueError("text selection index is outside the candidate layout")
+    if any(value < 0 or value >= encoded.layout.num_vision_tokens for value in vision):
+        raise ValueError("vision selection index is outside the candidate layout")
+    selected = set(encoded.protected_sequence_indices.tolist())
+    if text:
+        selected.update(encoded.text_sequence_indices[list(text)].tolist())
+    if vision:
+        selected.update(encoded.vision_sequence_indices[list(vision)].tolist())
+    return torch.tensor(sorted(selected), dtype=torch.long, device=encoded.input_embeddings.device)
+
+
+def score_gold_answer_selections(
+    model: Any,
+    encoded: EncodedSample,
+    answer_ids: torch.Tensor,
+    selections: list[CandidateSelection],
+    *,
+    variant_batch_size: int,
+) -> list[AnswerNLL]:
+    """Teacher-force arbitrary candidate subsets expressed in original indices."""
+
+    if variant_batch_size < 1:
+        raise ValueError("variant_batch_size must be positive")
+    if answer_ids.ndim != 1 or not len(answer_ids):
+        raise ValueError("answer_ids must be a non-empty rank-1 tensor")
+    if not selections:
+        return []
+    device = encoded.input_embeddings.device
+    answer_ids = answer_ids.to(device)
+    answer_embeddings = model.get_input_embeddings()(answer_ids)
+    grouped: dict[int, list[tuple[int, torch.Tensor]]] = {}
+    for order, selection in enumerate(selections):
+        keep = _selection_sequence_indices(encoded, selection)
+        grouped.setdefault(len(keep), []).append((order, keep))
+    results: list[AnswerNLL | None] = [None] * len(selections)
+    answer_length = len(answer_ids)
+    loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
+    for prompt_length, variants in grouped.items():
+        for start in range(0, len(variants), variant_batch_size):
+            batch = variants[start : start + variant_batch_size]
+            embeddings = torch.stack(
+                [
+                    torch.cat((encoded.input_embeddings[0, keep], answer_embeddings), dim=0)
+                    for _, keep in batch
+                ]
+            )
+            prompt_positions = torch.stack(
+                [encoded.position_ids[:, 0, keep] for _, keep in batch], dim=1
+            )
+            next_position = int(encoded.position_ids.max().item()) + 1
+            answer_positions = torch.arange(
+                next_position,
+                next_position + answer_length,
+                dtype=prompt_positions.dtype,
+                device=device,
+            ).view(1, 1, -1).expand(3, len(batch), -1)
+            position_ids = torch.cat((prompt_positions, answer_positions), dim=2)
+            total_length = prompt_length + answer_length
+            outputs = model(
+                inputs_embeds=embeddings,
+                position_ids=position_ids,
+                attention_mask=torch.ones(
+                    (len(batch), total_length), dtype=torch.long, device=device
+                ),
+                use_cache=False,
+                logits_to_keep=answer_length + 1,
+                return_dict=True,
+            )
+            answer_logits = outputs.logits[:, :answer_length].float()
+            targets = answer_ids.unsqueeze(0).expand(len(batch), -1)
+            token_losses = loss_fn(
+                answer_logits.reshape(-1, answer_logits.shape[-1]), targets.reshape(-1)
+            ).reshape(len(batch), answer_length)
+            sums = token_losses.sum(dim=1)
+            for local, (order, _) in enumerate(batch):
+                results[order] = AnswerNLL(
+                    mean_nll=float((sums[local] / answer_length).item()),
+                    sum_nll=float(sums[local].item()),
+                    num_answer_tokens=answer_length,
+                )
+    if any(value is None for value in results):
+        raise RuntimeError("missing teacher-forced selection result")
+    return [value for value in results if value is not None]
 
 
 def _synchronize(device: torch.device) -> None:

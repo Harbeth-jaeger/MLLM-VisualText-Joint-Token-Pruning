@@ -1,11 +1,11 @@
 # 004 · Joint Pruning with a Learned Utility Scorer
 
-> 状态：待实现、待实验。
-> 本文预先记录实验目的、方法、评价口径与结果判定标准；不包含尚未运行的结果。
+> 状态：正式实验已完成。120/30 个 train/validation 样本用于标签生成与训练，固定 50 样本 test 已完成全部主对照评测。
+> 结论：首版 scorer 学到了一定跨模态排序信号，但总体排序能力弱且出现过拟合；下游结果未达到预先定义的继续路线标准。
 
 ## 1. Objective
 
-实验 003 将解决“视觉与文本分数是否可比”，但图文语义相关性不一定等于 token 对最终答案的作用。一个 chunk 可能与问题语义相关却没有提供答案证据，也可能与另一个 chunk 高度冗余。
+实验 003 原计划解决“视觉与文本分数是否可比”，但图文语义相关性不一定等于 token 对最终答案的作用。当前执行顺序调整为先完成实验 004，实验 003 后续作为独立对照、chunk 内 token 选择辅助方法及可选 scorer 特征。一个 chunk 可能与问题语义相关却没有提供答案证据，也可能与另一个 chunk 高度冗余。
 
 本实验训练一个轻量级 utility scorer，直接预测删除文本或视觉 chunk 对答案概率造成的边际影响。scorer 为两种模态输出同一标度的 utility scalar，而不要求 Qwen 原始视觉和文本 embedding 本身有可比余弦距离。
 
@@ -198,59 +198,125 @@ utility label 生成是本实验的主要成本。对含 $G$ 个 chunk 的样本
 
 ## 4. Results & Analysis & Conclusion
 
-### 4.1 标签正确性门槛
+### 4.1 运行完整性与数据划分
 
-训练前先验证：
+正式流程于 2026-10-17 20:59:06 CST 启动，23:36:58 CST 正常结束，总墙钟时间为 2 小时 37 分 52 秒。运行使用单张 GPU、BF16 和 FlashAttention 2。最终产物包括：
 
-1. 完整输入的 teacher-forced token NLL 可重复，无 label mask 偏移；
-2. 删除后输入长度、保留索引与 mRoPE 位置通过现有 invariant；
-3. 手工构造的唯一答案 chunk 被删除时，utility 明显高于无关 chunk；
-4. 同一删除变体重复前向的 NLL delta 在可接受数值误差内一致；
-5. train/validation/test 的 group ID 无交集。
+- 120 个 train 标签文件和 30 个 validation 标签文件；
+- 3 个独立训练 seed 的最佳 checkpoint 与完整训练历史；
+- 固定 50 样本 test 上 25 个条件、共 1250 条逐样本结果；
+- 1250 条记录的 `(sample_id, method, retention, seed)` 均唯一，且全部记录 `flash_attention_2`；
+- 所有剪枝条件的 `budget_deviation=0`，实际候选保留率分别为 0.2498、0.4999 和 0.7498。
 
-任意一项失败都不应启动全量 label 生成。
+划分 seed 为 2026。MMCoQA 这 200 个样本在当前按共享图片连通的分组规则下形成 200 个独立 group，最终严格划分为 120/30/50；固定 test manifest 与实验 002/003 一致，没有 test-connected 样本进入训练或验证。这里的泄漏检查只覆盖当前可获得的图片路径关联，不能排除数据集中未显式标注的语义近重复。
 
-### 4.2 Scorer 本身的成功标准
+本轮实际完成的下游方法为 No Pruning、Fixed Joint、Random Joint（3 seeds）、Raw Qwen Joint 和 Learned Utility Joint（3 个训练 seeds）。预注册中的 Aligned Encoder Joint 依赖尚未运行的实验 003，Oracle Utility 也未实现，因此二者不应被视为本轮已完成对照。
 
-必须同时报告总体、文本、视觉和跨模态 pair 的排名指标。若总体指标较高但跨模态 pair 接近随机，则不能认为“统一 utility 标尺”已学到。
+### 4.2 Utility label 分布与成本
 
-关键检查包括：
+| Split | 样本 | Chunk 总数 | 平均/样本 | Text / Vision chunk | Utility 均值 ± 标准差 | 正 / 近零 / 负比例 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Train | 120 | 17,817 | 148.5 | 1,009 / 16,808 | 0.0007 ± 0.1435 | 40.6% / 11.7% / 47.6% |
+| Validation | 30 | 5,023 | 167.4 | 256 / 4,767 | 0.0198 ± 0.1469 | 46.7% / 7.7% / 45.5% |
 
-- validation ranking 指标明显高于随机；
-- 三个 seed 的方向一致，不依赖单一最佳 checkpoint；
-- 高分 chunk 实际删除后造成的 NLL 恶化高于低分 chunk；
-- modality-only、position-only 和 length-only 弱基线无法解释主要收益。
+“近零”定义为 $|u_g|\le 0.001$，与训练时忽略近零 pair 的阈值一致。Train utility 的中位数为 -0.0004，1%/99% 分位数为 -0.2312/0.3123，完整范围为 -5.2754 到 8.9714。标签并未退化为全零或单一符号，说明 leave-one-out NLL 至少产生了可用于排序的非平凡监督信号。
 
-### 4.3 下游主结果判定
+模态分布极不均衡：train 中视觉 chunk 占 94.3%。文本 utility 的标准差为 0.5280，约为视觉 utility 标准差 0.0707 的 7.5 倍；文本中位数为 0.0063，视觉中位数为 -0.0005。这意味着共享标尺必须同时处理数量不平衡和明显不同的长尾尺度，也增加了 scorer 依赖模态捷径的风险。
 
-实验的核心证据不是 scorer 的 regression loss，而是在严格预算下的未见 test 结果。
+标签生成的实际开销如下：
 
-继续该路线的正向证据为：
+| Split | 总 GPU 时间 | 平均/样本 | 中位数/样本 | P95/样本 | 峰值显存 | 磁盘 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Train | 84.98 min | 42.49 s | 34.01 s | 103.02 s | 20.68 GB | 125 MB |
+| Validation | 36.67 min | 73.34 s | 47.28 s | 200.95 s | 21.14 GB | 35 MB |
 
-1. Learned Utility 在 75% 和 50% 上均高于 Random Joint 三种子均值；
-2. 相对实验 003 呈现一致的配对改善，说明学到的不只是语义相关性；
-3. 多个训练 seed 的差异小于方法相对主对照的收益；
-4. scorer 在线开销计入后，在至少一个不明显降低 Accuracy 的预算上保持端到端加速。
+两部分合计约 121.65 GPU-min 和 160 MB 标签缓存。样本耗时随 chunk 数显著增长；validation 平均更慢主要来自其平均 chunk 数更高及少数长样本，不能解释为 split 本身的系统差异。
 
-在 50 样本上仍应报告置信区间、配对胜负和精确配对检验。若只有 oracle 好而 learned scorer 差，说明 label 存在信号但特征或模型不足；若 oracle 也不优于 random，应优先怀疑单次 leave-one-out 标签与目标预算不匹配。
+### 4.3 Scorer 训练结果
 
-### 4.4 风险与 fallback
+checkpoint 只由 validation macro pairwise accuracy 选择。三个 seed 的最佳结果为：
 
-| 风险 | 影响 | Fallback |
+| Seed | 最佳 epoch | 训练轮数 | 最佳 val macro pairwise acc. | 跨模态 pairwise acc. | Val MAE | 首轮 → 末轮 train loss |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 1 | 14 | 52.85% | 64.39% | 0.0603 | 0.9803 → 0.6135 |
+| 1 | 1 | 14 | 53.06% | 64.40% | 0.0604 | 0.9792 → 0.6258 |
+| 2 | 4 | 17 | 53.29% | 64.69% | 0.0604 | 0.9794 → 0.5848 |
+
+训练 loss 稳定下降约 36%–40%，所以 smoke test 中“loss 能否下降”的问题在正式数据上得到肯定答案。但 validation 总体排序仅略高于 50% 随机水平；最佳 epoch 很早，之后 train loss 继续下降而 validation 排名和 MAE 多数变差，表现出明显过拟合。跨模态准确率稳定在约 64.5%，说明 scorer 确实学到部分图文间标尺，但这没有转化为足够强的样本内细粒度排序。
+
+当前实现没有输出预注册的 Spearman、Kendall、top-k utility recall，也没有运行 modality-only、position-only 和 length-only 弱基线。因此，本轮不能确认 64.5% 的跨模态结果来自语义 utility，而不是模态、长度或位置等捷径；这是报告结论的明确边界。
+
+### 4.4 Test 主结果
+
+以下均为固定 50 个未参与训练与模型选择的 test 样本。`±` 为 3 个 seed 的总体标准差；单 seed 方法不报告标准差。
+
+| 方法 | 保留率 | Accuracy | Robust Accuracy | 平均输入 token | 平均 Text / Vision budget |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| No Pruning | 100% | 70.0% | 70.0% | 2645.5 | 458.9 / 2103.6 |
+| Fixed Joint | 75% | 64.0% | 66.0% | 2004.6 | 417.2 / 1504.4 |
+| Random Joint | 75% | 64.0% ± 3.3% | 66.0% ± 3.3% | 2004.6 | seed-dependent |
+| Raw Qwen Joint | 75% | **66.0%** | 68.0% | 2004.6 | 454.0 / 1467.5 |
+| **Learned Utility Joint** | **75%** | 64.7% ± 2.5% | 66.7% ± 2.5% | 2004.6 | 441.0 / 1480.6 |
+| Fixed Joint | 50% | 62.0% | 62.0% | 1364.0 | 362.4 / 918.6 |
+| Random Joint | 50% | **62.7% ± 4.1%** | **64.0% ± 4.3%** | 1364.0 | seed-dependent |
+| Raw Qwen Joint | 50% | **66.0%** | **66.0%** | 1364.0 | 434.4 / 846.6 |
+| **Learned Utility Joint** | **50%** | 60.0% ± 1.6% | 61.3% ± 2.5% | 1364.0 | 420.1 / 860.9 |
+| Fixed Joint | 25% | 42.0% | 42.0% | 723.3 | 264.9 / 375.3 |
+| Random Joint | 25% | 47.3% ± 0.9% | 48.7% ± 0.9% | 723.3 | seed-dependent |
+| Raw Qwen Joint | 25% | 46.0% | 46.0% | 723.3 | 349.0 / 291.2 |
+| **Learned Utility Joint** | **25%** | 47.3% ± 2.5% | 49.3% ± 2.5% | 723.3 | 333.9 / 306.4 |
+
+Learned Utility 的逐 seed Accuracy/Robust Accuracy 为：75% 下 64/66、68/70、62/64；50% 下 62/64、60/62、58/58；25% 下 48/50、50/52、44/46。75% 的最佳 seed 接近无剪枝基线，但其他 seed 没有复现；50% 三个 seed 都不超过 Raw Qwen；25% 的均值与 Random 完全相同。
+
+No Pruning 的 Accuracy 为 35/50，Wilson 95% CI 为 [56.2%, 80.9%]。Learned Utility 各 seed 的区间较宽：75% 为 [50.1%, 75.9%]、[54.2%, 79.2%]、[48.2%, 74.1%]；50% 为 [48.2%, 74.1%]、[46.2%, 72.4%]、[44.2%, 70.6%]；25% 为 [34.8%, 61.5%]、[36.6%, 63.4%]、[31.2%, 57.7%]。50 样本只能识别较大的效果差异，当前 1–3 个样本量级的差别不能作强结论。
+
+相对 No Pruning，Learned Utility 的原始指标“由对变错 / 由错变对”分别为：75% 的 4/1、2/1、5/1；50% 的 5/1、7/2、9/3；25% 的 12/1、11/1、14/1。双侧精确 McNemar 检验在 75% 和 50% 均不显著（所有 $p\ge0.146$），25% 三个 seed 均显著差于无剪枝（$p=0.0034,0.0063,0.0010$）。Learned 与相同 seed Random、以及 Learned 与 Raw Qwen 的逐 seed 配对比较全部 $p\ge0.289$；没有证据表明观察到的小差异超过这 50 个样本上的随机波动。
+
+### 4.5 速度、显存与计时边界
+
+| 条件 | Planner ms | Prefill ms | 相对 No Pruning 的 prefill 降幅 | Decode ms | 峰值显存 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| No Pruning | 32.2 | 363.2 | — | 623.0 | 16.43 GB |
+| Learned 75%（3-seed mean） | 7.6 | 313.9 | 13.6% | 445.8 | 16.23 GB |
+| Learned 50%（3-seed mean） | 10.1 | 205.1 | 43.5% | 472.9 | 16.04 GB |
+| Learned 25%（3-seed mean） | 7.4 | 124.1 | 65.8% | 491.9 | 15.84 GB |
+
+严格减少输入 token 确实带来了清晰的 prefill 缩短，显存也小幅下降。但当前 `planning_ms` 只覆盖预算规划器，不包括 Qwen relevance、utility 特征构造、scorer 前向、CPU 预处理和 I/O；`vision_encode_ms` 单独记录，且 decode 时间还受各条件输出长度影响。因此这些数字不能被表述为完整在线端到端加速，预注册成功标准中的“计入 scorer 在线开销后仍加速”尚未被当前 instrumentation 证明。
+
+### 4.6 对预注册成功标准的逐项判定
+
+| 成功标准 | 结果 | 判定 |
 | --- | --- | --- |
-| leave-one-out 无法捕捉交互 | 高压缩率下排名失效 | 采样子集边际贡献，做 Monte Carlo Shapley 近似 |
-| gold-answer NLL 与自由生成 Accuracy 不一致 | scorer 优化代理目标 | 加入 sequence-level preference/是否答对信号，但保留 NLL 主口径 |
-| utility label 噪声大 | 训练不稳定 | 用 pairwise loss、Huber loss、忽略近零差值 pair |
-| scorer 学到位置/模态捷径 | 分布外泛化差 | 报告弱基线、做 feature ablation，增加跨模态 pair |
-| label 生成过慢 | GPU-hours 过高 | 先采样部分 chunk，batch teacher forcing，优先高变异样本 |
-| MMCoQA 训练数据过小 | scorer 过拟合 | 降低模型容量，增加其他长上下文 benchmark 训练数据，保持 benchmark-held-out 评价 |
+| 75% 和 50% 均高于 Random 三种子均值 | 75%：64.7% vs 64.0%；50%：60.0% vs 62.7% | **失败** |
+| 相对实验 003 有一致配对改善 | 实验 003 尚未运行，Aligned Encoder 对照缺失 | **未评估** |
+| seed 波动小于方法收益 | 75%/25% seed 标准差 2.5%，而相对 Random 差值仅 +0.7%/0%；50% 为 -2.7% | **失败** |
+| 计入 scorer 在线开销后保持端到端加速 | prefill 明显下降，但完整 scorer/特征开销未计时 | **未证明** |
+
+### 4.7 结论
+
+首版实验 004 **没有验证 Learned Utility Joint 优于现有选择方法**。最可信的正向结果是：leave-one-out 标签具有非退化分布，三个 seed 都能学到稳定的跨模态粗排序信号；最可信的负向结果是：总体 validation pairwise accuracy 仍接近随机，训练很早过拟合，并且 50% 主预算下持续弱于 Raw Qwen，75% 也没有稳定优势。
+
+这组结果更支持“当前标签/特征与目标预算不完全匹配”，而不是“MLP 容量不足”。单 chunk leave-one-out 描述的是其余内容完整时的局部边际效用，无法直接刻画同时删除大量相似或互补 chunk 后的效用；同时，视觉 chunk 数量占绝对多数、文本 label 方差远高于视觉，也使统一回归与排序更困难。现阶段不应仅靠扩大 MLP 或增加 epoch 延续路线。
+
+由于 Oracle Utility、弱特征基线和实验 003 aligned 对照尚未运行，本轮还不能区分以下三种解释：标签本身与高压缩目标错位、当前输入特征不足、或 scorer 主要学到了模态/位置捷径。后续实验应以区分这三者为目标。
+
+### 4.8 结果产物
+
+本报告中的汇总结果来自以下可复核产物：
+
+- 主配置：`configs/experiments/004_learned_utility_scorer.yaml`；
+- 划分与审计：`data/interim/experiment_004/splits/`；
+- 标签、checkpoint、训练历史、逐样本结果和完整日志：`/data2/wenhaozhang/runs/mllm_prune/experiment_004/`；
+- 自动汇总：`outputs/experiment_004/summary.json`。
+
+Accuracy、预算和阶段耗时取自自动汇总；label 分位数、Wilson 区间及双侧精确 McNemar $p$ 值由上述原始 `.pt`/JSONL 重新计算。运行环境未安装 SciPy，因此精确配对检验使用二项分布公式直接计算，没有依赖近似检验或外部统计库。
 
 ## 5. Next
 
-1. 先固化 group-aware train/validation/test manifest，对近重复文档、对话和图像做泄漏检查；
-2. 在 3–5 个训练样本上生成 leave-one-out label，用手工案例检验符号、mask 和 mRoPE；
-3. 实测标签生成的单样本时间、batch 峰值显存、缓存大小和 GPU-hours，再决定正式标签规模；
-4. 先训练最小共享 MLP，证明 validation ranking 可学，再增加 redundancy、aligned relevance 和子集边际标签；
-5. 使用 3 个 seed 训练并锁定 checkpoint，最后一次性运行固定 50 样本 test；
-6. 若 scorer 显著优于 aligned relevance，再扩展至 MMLongBench-Doc 等文本/视觉 token 比例更多样的数据。
+1. 按既定安排完成实验 003，把外部 encoder 作为独立对照和 chunk 内 token 选择辅助方法；暂不把 test 结果用于调参。
+2. 在 validation 上补齐 Oracle leave-one-out 排序。如果 Oracle 在 50%/25% 仍不优于 Random，应优先改为预算条件化的子集边际标签，而不是改 scorer。
+3. 补 modality-only、position/coordinate-only、length-only 和 Qwen-relevance-only 弱基线，并输出同模态 pairwise、Spearman/Kendall 与 top-k recall，判断当前 64.5% 跨模态准确率是否来自捷径。
+4. 若 Oracle 有明显上限，再尝试更小模型、模态平衡采样/加权、稳健 label 归一化，以及在 50%/25% 子集上采样 conditional marginal utility；所有选择只在 validation 上完成。
+5. 为特征构造、scorer 前向和完整请求墙钟时间增加独立 CUDA 同步计时，再评价真实在线收益。
+6. 当前固定 test 已经被查看；后续方法迭代应新增独立 held-out 样本或新 benchmark，避免继续用这 50 个样本进行模型选择。
 
